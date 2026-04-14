@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  jj-exec -r REVSET -- COMMAND [ARG...]
+  jj-exec --revisions REVSET -- COMMAND [ARG...]
+
+Edits each revision selected by REVSET and runs COMMAND at each step.
+Revisions are visited from older to newer using `jj log --reversed`.
+The script stops immediately if COMMAND exits non-zero.
+
+Examples:
+  jj-exec -r 'a1b2c3::d4e5f6' -- make test
+  jj-exec -r 'root()..@' -- ./lint.sh
+EOF
+}
+
+revset=
+saw_separator=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--revisions)
+      if [[ $# -lt 2 ]]; then
+        echo "error: $1 requires a revset argument" >&2
+        usage >&2
+        exit 1
+      fi
+      revset=$2
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      saw_separator=true
+      shift
+      break
+      ;;
+    *)
+      echo "error: unexpected argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z $revset ]]; then
+  echo "error: missing required -r/--revisions argument" >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ $saw_separator == false ]]; then
+  echo "error: expected '--' before the command to run" >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ $# -eq 0 ]]; then
+  echo "error: missing command to run" >&2
+  usage >&2
+  exit 1
+fi
+
+user_command=("$@")
+
+original_change_id=$(jj log -r @ --no-graph -T 'change_id')
+
+restore_working_copy() {
+  local exit_code=$?
+  local current_change_id=""
+
+  trap - EXIT
+
+  if [[ $exit_code -ne 0 ]]; then
+    exit "$exit_code"
+  fi
+
+  current_change_id=$(jj log -r @ --no-graph -T 'change_id' 2>/dev/null || true)
+  if [[ $current_change_id == "$original_change_id" ]]; then
+    exit "$exit_code"
+  fi
+
+  echo "==> jj edit $original_change_id (restore)"
+  if ! jj edit "$original_change_id"; then
+    echo "warning: failed to restore working copy to original change $original_change_id" >&2
+  fi
+
+  exit "$exit_code"
+}
+
+trap restore_working_copy EXIT
+
+revision_count=$(jj log -r "$revset" --count)
+if [[ $revision_count -eq 0 ]]; then
+  echo "error: no revisions found for revset: $revset" >&2
+  exit 1
+fi
+
+while IFS= read -r change_id; do
+  [[ -n $change_id ]] || continue
+  echo "==> jj edit $change_id"
+  jj edit "$change_id"
+
+  echo "==> ${user_command[*]}"
+  if "${user_command[@]}"; then
+    continue
+  else
+    status=$?
+    echo "error: command failed for revision $change_id with exit code $status" >&2
+    exit "$status"
+  fi
+done < <(jj log -r "$revset" --no-graph --reversed -T 'change_id ++ "\n"')
