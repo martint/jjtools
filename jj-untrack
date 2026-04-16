@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  jj-untrack [--dry-run] [PATH...]
+
+Reads .gitignore files and untracks files matching gitignore patterns using
+`jj file untrack`. If PATH arguments are provided, only those paths are
+considered; otherwise the entire working tree is scanned.
+
+Options:
+  --dry-run    Show which files would be untracked without making changes
+  -h, --help   Show this help message
+
+Examples:
+  jj-untrack
+  jj-untrack --dry-run
+  jj-untrack src/
+EOF
+}
+
+dry_run=false
+paths=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        paths+=("$1")
+        shift
+      done
+      break
+      ;;
+    -*)
+      echo "error: unexpected option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      paths+=("$1")
+      shift
+      ;;
+  esac
+done
+
+repo_root=$(jj workspace root 2>/dev/null)
+
+# Collect patterns from all .gitignore files.
+# Three parallel arrays: pattern text, directory prefix relative to repo root, negation flag.
+patterns=()
+prefixes=()
+negated=()
+
+while IFS= read -r gitignore; do
+  rel_dir="${gitignore#"$repo_root/"}"
+  rel_dir=$(dirname "$rel_dir")
+  prefix=""
+  [[ $rel_dir != "." ]] && prefix="${rel_dir}/"
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -z $line || $line == \#* ]] && continue
+
+    neg=false
+    if [[ $line == \!* ]]; then
+      neg=true
+      line="${line:1}"
+    fi
+
+    patterns+=("$line")
+    prefixes+=("$prefix")
+    negated+=("$neg")
+  done < "$gitignore"
+done < <(find "$repo_root" \( -path '*/.jj' -o -path '*/.git' \) -prune -o -name '.gitignore' -print)
+
+# Returns 0 if FILE (relative to repo root) matches PATTERN anchored to PREFIX.
+file_matches() {
+  local file="$1" prefix="$2" pattern="$3"
+
+  # Strip trailing slash — used to denote directory-only patterns, but we
+  # match files so treat it as matching anything inside that directory.
+  pattern="${pattern%/}"
+
+  local anchored=false
+  if [[ $pattern == /* ]]; then
+    anchored=true
+    pattern="${pattern:1}"
+  fi
+
+  # A pattern only applies to files that live under the directory
+  # containing its .gitignore (i.e. under $prefix).
+  [[ -n $prefix && $file != "${prefix}"* ]] && return 1
+
+  if $anchored || [[ $pattern == */* ]]; then
+    # Anchored to the prefix directory.
+    local full="${prefix}${pattern}"
+    [[ $file == $full || $file == "${full}/"* ]] && return 0
+  else
+    # No slash: match against the file basename anywhere under prefix.
+    local rel="${file#"$prefix"}"
+    local basename="${file##*/}"
+    [[ $rel == $pattern || $rel == "${pattern}/"* ]] && return 0
+    [[ $rel == */"${pattern}" || $rel == */"${pattern}/"* ]] && return 0
+    [[ $basename == $pattern ]] && return 0
+  fi
+
+  return 1
+}
+
+# Get tracked files (optionally scoped to user-supplied paths).
+tracked=()
+while IFS= read -r f; do
+  [[ -n $f ]] && tracked+=("$f")
+done < <(jj file list "${paths[@]+"${paths[@]}"}")
+
+if [[ ${#tracked[@]} -eq 0 ]]; then
+  echo "No tracked files found."
+  exit 0
+fi
+
+to_untrack=()
+
+for file in "${tracked[@]}"; do
+  # Paths from `jj file list` are relative to repo root.
+  # Make sure they have no leading ./
+  file="${file#./}"
+
+  is_ignored=false
+  for i in "${!patterns[@]}"; do
+    if file_matches "$file" "${prefixes[$i]}" "${patterns[$i]}"; then
+      if [[ ${negated[$i]} == true ]]; then
+        is_ignored=false
+      else
+        is_ignored=true
+      fi
+    fi
+  done
+
+  $is_ignored && to_untrack+=("$file")
+done
+
+if [[ ${#to_untrack[@]} -eq 0 ]]; then
+  echo "No tracked files match gitignore patterns."
+  exit 0
+fi
+
+echo "Files to untrack (${#to_untrack[@]}):"
+printf '  %s\n' "${to_untrack[@]}"
+echo ""
+
+if $dry_run; then
+  echo "(dry run — no changes made)"
+  exit 0
+fi
+
+jj file untrack "${to_untrack[@]}"
